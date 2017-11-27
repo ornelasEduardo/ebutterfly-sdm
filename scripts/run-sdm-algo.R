@@ -1,7 +1,7 @@
-# Script to run Species Distribution Model using "bioclim" approach
+# Script to run Species Distribution Model with a variety of algorithms
 # Jeff Oliver
 # jcoliver@email.arizona.edu
-# 2017-09-07
+# 2017-11-20
 
 rm(list = ls())
 
@@ -10,7 +10,7 @@ rm(list = ls())
 # Gather path information
 # Load dependancies
 args = commandArgs(trailingOnly = TRUE)
-usage.string <- "Usage: Rscript --vanilla run-sdm.R <path/to/data/file> <output-file-prefix> <path/to/output/directory/> <number of background replicates>[optional] <threshold for occurrance>[optional]"
+usage.string <- "Usage: Rscript --vanilla run-sdm-algo.R <path/to/data/file> <output-file-prefix> <path/to/output/directory/> <algorithm string: CTA, GLM, or RF>[optional] <number of background replicates>[optional] <threshold for occurrance>[optional]"
 
 # Make sure a readable file is first argument
 if (length(args) < 1) {
@@ -58,18 +58,27 @@ if (any(write.access != 0)) {
               paste(required.writables[write.access != 0], collapse = "\n")))
 }
 
-# Check number of background replicates is ok (if provided)
-bg.replicates <- 50
-rep.threshold <- 0.5
+# See if they set algorithm
+sdm.algorithm <- "CTA"
 if (length(args) > 3) {
-  temp.reps <- as.integer(args[4])
+  tmp.algorithm <- toupper(args[4])
+  if (args[4] %in% c("CTA", "GLM", "RF")) {
+    sdm.algorithm <- tmp.algorithm
+  }
+}
+
+# Check number of background replicates is ok (if provided)
+bg.replicates <- 10
+rep.threshold <- 0.5
+if (length(args) > 4) {
+  temp.reps <- as.integer(args[5])
   if (!is.na(temp.reps)) {
     bg.replicates <- temp.reps
   }
   
   # Check threshold (if provided)
-  if (length(args) > 4) {
-    temp.threshold <- as.numeric(args[5])
+  if (length(args) > 5) {
+    temp.threshold <- as.numeric(args[6])
     if (!is.na(temp.threshold) && temp.threshold > 0.0 && temp.threshold <= 1.0) {
       rep.threshold <- temp.threshold
     }
@@ -77,9 +86,8 @@ if (length(args) > 3) {
 }
 
 
-
 # Load dependancies, keeping track of any that fail
-required.packages <- c("rgdal", "raster", "sp", "dismo", "maptools")
+required.packages <- c("rgdal", "raster", "sp", "dismo", "maptools", "gtools", "SSDM")
 missing.packages <- character(0)
 for (one.package in required.packages) {
   if (!suppressMessages(require(package = one.package, character.only = TRUE))) {
@@ -102,17 +110,36 @@ rm(f, functions)
 ################################################################################
 # DATA
 # Read data and set rng seed
-obs.data <- PrepareData(file = infile)
+orig.data <- read.csv(file = infile)
+obs.data <- orig.data[, c("scientific_name", "longitude", "latitude")]
 set.seed(19470909)
 
 ################################################################################
 # ANALYSIS
 # Run modeling and extract rasters
-species.rasters <- SDMBioclim(data = obs.data, bg.replicates = bg.replicates)
-presence.raster <- species.rasters$presence
+
+# min.max <- MinMaxCoordinates(x = obs.data)
+# geographic.extent <- extent(x = min.max)
+min.max <- c(-165, -52, 15, 75) # North America
+names(min.max) <- c("min.lon", "max.lon", "min.lat", "max.lat")
+geographic.extent <- extent(min.max)
+
+# Get the biolim data
+bioclim.data <- getData(name = "worldclim",
+                        var = "bio",
+                        res = 2.5, # Could try for better resolution, 0.5, but would then need to provide lat & long...
+                        path = "data/")
+bioclim.data <- stack(crop(x = bioclim.data, y = geographic.extent))
+
+sdms <- SDMAlgos(data = obs.data, 
+                 env.data = bioclim.data,
+                 sdm.algorithm = sdm.algorithm, 
+                 bg.replicates = bg.replicates)
+
+presence.raster <- sdms$presence
 presence.raster <- presence.raster > bg.replicates * rep.threshold
 presence.raster[presence.raster <= 0] <- NA
-probabilities.raster <- species.rasters$probabilities
+probabilities.raster <- sdms$probabilities
 probabilities.raster[probabilities.raster <= 0] <- NA
 
 ################################################################################
@@ -120,11 +147,13 @@ probabilities.raster[probabilities.raster <= 0] <- NA
 # Save graphics image of presence/absence
 # Save rasters of presence/absence and occurrence probabilities
 
-min.max <- MinMaxCoordinates(x = obs.data)
-
 # Save image to file
 data(wrld_simpl) # Need this for the map
-png.name <- paste0(outpath, outprefix, "-prediction.png")
+
+# Could restrict to observed distribution, but very coarse (giant pixels)
+# obs.min.max <- MinMaxCoordinates(x = obs.data)
+
+png.name <- paste0(outpath, outprefix, "-", sdm.algorithm, "-prediction.png")
 png(filename = png.name)
 par(mar = c(3, 3, 3, 1) + 0.1)
 plot(wrld_simpl, 
@@ -145,16 +174,18 @@ plot(wrld_simpl,
 box()
 # Restore default margins
 par(mar = c(5, 4, 4, 2) + 0.1)
+# This creates a nicer map:
+# plot(sdm@binary, legend = FALSE, col = c("#DEDEDE", "#228B22")) # Grey and forest green
 dev.off()
 
 # Save raster to files
 suppressMessages(writeRaster(x = probabilities.raster, 
-                             filename = paste0(outpath, outprefix, "-prediction.grd"),
+                             filename = paste0(outpath, outprefix, "-", sdm.algorithm, "-prediction.grd"),
                              format = "raster",
                              overwrite = TRUE))
 
 suppressMessages(writeRaster(x = presence.raster, 
-                             filename = paste0(outpath, outprefix, "-prediction-threshold.grd"),
+                             filename = paste0(outpath, outprefix, "-", sdm.algorithm, "-prediction-threshold.grd"),
                              format = "raster",
                              overwrite = TRUE))
 cat("Finished with file writing.\n")
